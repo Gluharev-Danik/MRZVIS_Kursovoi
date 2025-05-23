@@ -1,0 +1,360 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torchvision import transforms
+from torch.utils.data import DataLoader, Subset
+from torchvision.datasets import ImageFolder
+from sklearn.model_selection import StratifiedShuffleSplit
+from sklearn.metrics import classification_report, confusion_matrix, f1_score, accuracy_score
+import numpy as np
+import matplotlib.pyplot as plt
+import os
+import random
+import timm
+import mlflow
+
+
+# -----------------------------
+# 1. Фиксируем seed
+# -----------------------------
+def set_seed(seed):
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+set_seed(50)
+
+# -----------------------------
+# 2. Устройство
+# -----------------------------
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
+# Инициализация MLflow
+mlflow.start_run()
+
+# -----------------------------
+# 3. Параметры
+# -----------------------------
+img_size = (224, 224)
+batch_size = 16  # Mixer работает лучше при меньших batch'ах
+epochs = 10
+learning_rate = 1e-4
+early_stop_patience = 5
+save_best_model = True
+best_model_path = 'best_mlp_mixer.pth'
+threshold_path = 'best_threshold.npy'
+
+# Логирование параметров в MLflow
+mlflow.log_params({
+    "img_size": img_size,
+    "batch_size": batch_size,
+    "epochs": epochs,
+    "learning_rate": learning_rate,
+    "early_stop_patience": early_stop_patience,
+    "model": "mixer_b16_224"
+})
+
+# -----------------------------
+# 4. Преобразования
+# -----------------------------
+transform_train = transforms.Compose([
+    transforms.Resize(img_size),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    transforms.RandomHorizontalFlip(p=0.5),
+])
+
+transform_test = transforms.Compose([
+    transforms.Resize(img_size),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+])
+
+# -----------------------------
+# 5. Загрузка данных с переразделением train/val
+# -----------------------------
+train_dir = 'train'
+test_dir = 'test'
+
+train_dataset = ImageFolder(root=train_dir, transform=transform_train)
+
+# Переразделение train → train / val (с балансом)
+sss = StratifiedShuffleSplit(n_splits=1, test_size=0.1, random_state=42)
+train_indices, val_indices = next(sss.split(train_dataset.samples, train_dataset.targets))
+
+train_subset = Subset(train_dataset, train_indices)
+val_subset = Subset(train_dataset, val_indices)
+
+test_dataset = ImageFolder(root=test_dir, transform=transform_test)
+
+print("Classes:", train_dataset.class_to_idx)
+print("Train samples:", len(train_subset))
+print("Val samples:", len(val_subset))
+print("Test samples:", len(test_dataset))
+
+# DataLoader
+train_loader = DataLoader(train_subset, batch_size=batch_size, shuffle=False)
+val_loader = DataLoader(val_subset, batch_size=batch_size, shuffle=False)
+test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+
+# -----------------------------
+# 6. Балансировка классов через Sampler
+# -----------------------------
+targets = np.array([train_dataset.targets[i] for i in train_indices])
+class_counts = np.bincount(targets)
+weights = 1. / class_counts
+samples_weights = weights[targets]
+sampler = torch.utils.data.WeightedRandomSampler(samples_weights, len(targets))
+
+train_loader = DataLoader(train_dataset, batch_size=batch_size, sampler=sampler)
+
+# -----------------------------
+# 7. Модель: MLP-Mixer-B16 + Fine-tuning
+# -----------------------------
+model = timm.create_model('mixer_b16_224', pretrained=True)
+
+for param in model.parameters():
+    param.requires_grad = True
+
+# Замена головы
+model.head = nn.Sequential(
+    nn.Dropout(0.5),
+    nn.Linear(model.head.in_features, 1),
+    nn.Sigmoid()
+)
+
+model = model.to(device)
+
+# -----------------------------
+# 8. Loss и Optimizer
+# -----------------------------
+class_weights_tensor = torch.tensor([class_counts[0] / class_counts[1]], device=device)
+criterion = nn.BCELoss(weight=class_weights_tensor)
+optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-5)
+
+# -----------------------------
+# 9. LR Scheduler + Early Stopping
+# -----------------------------
+scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=2)
+
+
+class EarlyStopping:
+    def __init__(self, patience=5):
+        self.patience = patience
+        self.best_f1 = 0.0
+        self.counter = 0
+        self.early_stop = False
+
+    def __call__(self, val_f1):
+        if val_f1 > self.best_f1:
+            self.best_f1 = val_f1
+            self.counter = 0
+        else:
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.early_stop = True
+        return self.early_stop
+
+
+early_stopping = EarlyStopping(patience=early_stop_patience)
+
+
+# -----------------------------
+# 10. Подбор оптимального порога
+# -----------------------------
+def find_optimal_threshold(model, data_loader, device):
+    model.eval()
+    all_probs = []
+    all_labels = []
+
+    with torch.no_grad():
+        for inputs, labels in data_loader:
+            inputs = inputs.to(device)
+            outputs = model(inputs).cpu().numpy()
+            all_probs.extend(outputs)
+            all_labels.extend(labels.numpy())
+
+    all_probs = np.array(all_probs)
+    all_labels = np.array(all_labels)
+
+    thresholds = np.linspace(0.1, 0.9, 50)
+    best_threshold = 0.5
+    best_f1 = 0.0
+
+    for threshold in thresholds:
+        preds = (all_probs > threshold).astype(int)
+        current_f1 = f1_score(all_labels, preds)
+        if current_f1 > best_f1:
+            best_f1 = current_f1
+            best_threshold = threshold
+
+    print(f"\n[INFO] Лучший порог: {best_threshold:.4f}, достигнутый F1-score: {best_f1:.4f}")
+    return best_threshold
+
+
+best_threshold = find_optimal_threshold(model, val_loader, device)
+np.save(threshold_path, best_threshold)
+print(f"[INFO] Порог сохранён: {best_threshold:.4f}")
+mlflow.log_metric("best_threshold", best_threshold)
+
+# -----------------------------
+# 11. Обучение модели
+# -----------------------------
+history = {'train_loss': [], 'val_loss': [], 'val_f1': [], 'train_f1': [], 'train_acc': [], 'val_acc': []}
+best_val_f1 = 0.0
+
+model.train()
+
+for epoch in range(epochs):
+    running_loss = 0.0
+    train_probs = []
+    train_labels = []
+
+    for inputs, labels in train_loader:
+        inputs, labels = inputs.to(device), labels.to(device).float().unsqueeze(1)
+
+        optimizer.zero_grad()
+        outputs = model(inputs)
+        loss = criterion(outputs, labels)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        optimizer.step()
+
+        running_loss += loss.item() * inputs.size(0)
+        train_probs.extend(outputs.detach().cpu().numpy())
+        train_labels.extend(labels.cpu().numpy())
+
+    epoch_loss = running_loss / len(train_subset)
+    history['train_loss'].append(epoch_loss)
+
+    # Расчет метрик для тренировочных данных
+    train_preds = (np.array(train_probs) > best_threshold).astype(int)
+    train_f1 = f1_score(train_labels, train_preds)
+    train_acc = accuracy_score(train_labels, train_preds)
+    history['train_f1'].append(train_f1)
+    history['train_acc'].append(train_acc)
+
+    # Логирование тренировочных метрик
+    mlflow.log_metric("train_loss", epoch_loss, step=epoch)
+    mlflow.log_metric("train_f1", train_f1, step=epoch)
+    mlflow.log_metric("train_acc", train_acc, step=epoch)
+
+    # Валидация
+    model.eval()
+    val_loss = 0.0
+    correct_val = 0
+    total_val = 0
+    all_probs = []
+    all_labels = []
+
+    with torch.no_grad():
+        for inputs, labels in val_loader:
+            inputs, labels = inputs.to(device), labels.to(device).float().unsqueeze(1)
+            outputs = model(inputs)
+            probs = outputs.cpu().numpy()
+            loss = criterion(outputs, labels)
+            val_loss += loss.item() * inputs.size(0)
+            preds = (probs > best_threshold).astype(int)
+            total_val += labels.size(0)
+            correct_val += (preds == labels.cpu().numpy()).sum()
+            all_probs.extend(probs)
+            all_labels.extend(labels.cpu().numpy())
+
+    val_loss /= len(val_subset)
+    val_acc = correct_val / total_val
+    val_f1 = f1_score(all_labels, (np.array(all_probs) > best_threshold).astype(int))
+    history['val_loss'].append(val_loss)
+    history['val_f1'].append(val_f1)
+    history['val_acc'].append(val_acc)
+
+    # Логирование валидационных метрик
+    mlflow.log_metric("val_loss", val_loss, step=epoch)
+    mlflow.log_metric("val_f1", val_f1, step=epoch)
+    mlflow.log_metric("val_acc", val_acc, step=epoch)
+
+    print(f"Epoch {epoch + 1}/{epochs} | Train Loss: {epoch_loss:.4f} | "
+          f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}, Val F1: {val_f1:.4f}")
+
+    # Сохранение лучшей модели
+    if save_best_model and val_f1 > best_val_f1:
+        best_val_f1 = val_f1
+        torch.save(model.state_dict(), best_model_path)
+        print("✅ Best model saved.")
+
+    scheduler.step(val_f1)
+    early_stopping(val_f1)
+
+    if early_stopping.early_stop:
+        print("Early stopping triggered.")
+        break
+
+# -----------------------------
+# 12. Тестирование с лучшей моделью
+# -----------------------------
+model.load_state_dict(torch.load(best_model_path))
+model.eval()
+
+all_probs = []
+all_labels = []
+test_loss = 0.0
+
+with torch.no_grad():
+    for inputs, labels in test_loader:
+        inputs, labels = inputs.to(device), labels.to(device).float().unsqueeze(1)
+        outputs = model(inputs)
+        loss = criterion(outputs, labels)
+        test_loss += loss.item() * inputs.size(0)
+        probs = outputs.cpu().numpy()
+        all_probs.extend(probs)
+        all_labels.extend(labels.cpu().numpy())
+
+test_loss /= len(test_dataset)
+test_preds = (np.array(all_probs) > best_threshold).astype(int)
+test_labels = np.array(all_labels)
+test_f1 = f1_score(test_labels, test_preds)
+test_acc = accuracy_score(test_labels, test_preds)
+
+# Логирование тестовых метрик
+mlflow.log_metrics({
+    "test_loss": test_loss,
+    "test_f1": test_f1,
+    "test_acc": test_acc
+})
+
+print("\nClassification Report (Best Model + Optimal Threshold):")
+print(classification_report(test_labels, test_preds, target_names=['Normal', 'Pneumonia']))
+
+print("\nConfusion Matrix:")
+print(confusion_matrix(test_labels, test_preds))
+
+print(f"\n[INFO] Использован порог: {best_threshold:.4f}")
+
+# -----------------------------
+# 13. Графики обучения
+# -----------------------------
+plt.figure(figsize=(12, 5))
+
+plt.subplot(1, 2, 1)
+plt.plot(history['train_loss'], label='Train Loss')
+plt.plot(history['val_loss'], label='Val Loss')
+plt.title('Loss')
+plt.legend()
+
+plt.subplot(1, 2, 2)
+plt.plot(history['val_f1'], label='Val F1-score', color='green')
+plt.axhline(y=best_threshold, color='r', linestyle='--', label='Threshold')
+plt.title('F1-score динамика')
+plt.legend()
+
+plt.tight_layout()
+plt.savefig("training_metrics.png")
+mlflow.log_artifact("training_metrics.png")
+plt.show()
+
+# Завершение сессии MLflow
+mlflow.end_run()
